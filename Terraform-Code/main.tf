@@ -96,15 +96,72 @@ resource "aws_eks_cluster" "powerdevops" {
   }
 }
 
-
-resource "aws_eks_addon" "ebs_csi_driver" {
-  cluster_name    = aws_eks_cluster.powerdevops.name
-  addon_name      = "aws-ebs-csi-driver"
-  
-  resolve_conflicts_on_create = "OVERWRITE"
-  resolve_conflicts_on_update = "OVERWRITE"
+data "aws_eks_cluster" "this" {
+  name       = aws_eks_cluster.powerdevops.name
+  depends_on = [aws_eks_cluster.powerdevops]
 }
 
+data "tls_certificate" "eks" {
+  url = data.aws_eks_cluster.this.identity[0].oidc[0].issuer
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  url             = data.aws_eks_cluster.this.identity[0].oidc[0].issuer
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+}
+
+resource "aws_iam_role" "ebs_csi_irsa" {
+  name = "powerdevops-ebs-csi-irsa"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = {
+        Federated = aws_iam_openid_connect_provider.eks.arn
+      },
+      Action = "sts:AssumeRoleWithWebIdentity",
+      Condition = {
+        StringEquals = {
+          # The EKS add-on uses this SA by default:
+          # namespace: kube-system, name: ebs-csi-controller-sa
+          "${replace(data.aws_eks_cluster.this.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:kube-system:ebs-csi-controller-sa"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ebs_csi_irsa_policy" {
+  role       = aws_iam_role.ebs_csi_irsa.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+
+data "aws_eks_addon_version" "ebs" {
+  addon_name         = "aws-ebs-csi-driver"
+  kubernetes_version = data.aws_eks_cluster.this.version
+  most_recent        = true
+}
+
+resource "aws_eks_addon" "ebs_csi_driver" {
+  cluster_name  = aws_eks_cluster.powerdevops.name
+  addon_name    = "aws-ebs-csi-driver"
+  # Optional but recommended to stop Terraform re-install warnings:
+  addon_version = data.aws_eks_addon_version.ebs.version
+
+  # CRITICAL: give the add-on its IAM role
+  service_account_role_arn = aws_iam_role.ebs_csi_irsa.arn
+
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  depends_on = [
+    aws_eks_node_group.powerdevops,            # ensure nodes are ready to schedule
+    aws_iam_openid_connect_provider.eks,       # IRSA provider exists
+    aws_iam_role_policy_attachment.ebs_csi_irsa_policy
+  ]
+}
 
 resource "aws_eks_node_group" "powerdevops" {
   cluster_name    = aws_eks_cluster.powerdevops.name
@@ -184,8 +241,5 @@ resource "aws_iam_role_policy_attachment" "powerdevops_node_group_registry_polic
   policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
 }
 
-resource "aws_iam_role_policy_attachment" "powerdevops_node_group_ebs_policy" {
-  role       = aws_iam_role.powerdevops_node_group_role.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
-}
+
 
